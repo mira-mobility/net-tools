@@ -786,6 +786,19 @@ impl SocketState {
             socket.set_only_v6(true)?;
         }
 
+        // mp-iroh POC: pin this socket to a physical interface via SO_BINDTODEVICE.
+        // Hardcoded mapping by bind port through env vars `IROH_BIND_DEV_<port>`
+        // (e.g. IROH_BIND_DEV_6000=eth0). Linux-only; no-op elsewhere or when unset.
+        // Must be set before bind() so the binding is scoped to the device.
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia"))]
+        {
+            let key = format!("IROH_BIND_DEV_{}", addr.port());
+            if let Ok(dev) = std::env::var(&key) {
+                tracing::info!(port = addr.port(), device = %dev, "mp-iroh: binding UDP socket to device");
+                socket.bind_device(Some(dev.as_bytes()))?;
+            }
+        }
+
         // Binding must happen before calling noq, otherwise `local_addr`
         // is not yet available on all OSes.
         socket.bind(&addr.into())?;
