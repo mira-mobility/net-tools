@@ -52,18 +52,33 @@ impl UdpSocket {
     /// Bind to the given port only on localhost.
     pub fn bind_local(network: IpFamily, port: u16) -> io::Result<Self> {
         let addr = SocketAddr::new(network.local_addr(), port);
-        Self::bind_raw(addr)
+        Self::bind_raw(addr, None)
     }
 
     /// Bind to the given port and listen on all interfaces.
     pub fn bind(network: IpFamily, port: u16) -> io::Result<Self> {
         let addr = SocketAddr::new(network.unspecified_addr(), port);
-        Self::bind_raw(addr)
+        Self::bind_raw(addr, None)
     }
 
     /// Bind to any provided [`SocketAddr`].
     pub fn bind_full(addr: impl Into<SocketAddr>) -> io::Result<Self> {
-        Self::bind_raw(addr)
+        Self::bind_raw(addr, None)
+    }
+
+    /// Bind to any provided [`SocketAddr`], pinned to a physical interface.
+    ///
+    /// `device` is an interface name (e.g. `b"eth0"`); when `Some` the socket is
+    /// pinned to it via `SO_BINDTODEVICE` (Linux/Android/Fuchsia only, no-op
+    /// elsewhere). The device is retained so it is re-applied on [`rebind`], which
+    /// re-creates the underlying socket on network changes.
+    ///
+    /// [`rebind`]: Self::rebind
+    pub fn bind_full_with_device(
+        addr: impl Into<SocketAddr>,
+        device: Option<Vec<u8>>,
+    ) -> io::Result<Self> {
+        Self::bind_raw(addr, device)
     }
 
     /// Is the socket broken and needs a rebind?
@@ -96,8 +111,8 @@ impl UdpSocket {
         Ok(())
     }
 
-    fn bind_raw(addr: impl Into<SocketAddr>) -> io::Result<Self> {
-        let socket = SocketState::bind(addr.into())?;
+    fn bind_raw(addr: impl Into<SocketAddr>, device: Option<Vec<u8>>) -> io::Result<Self> {
+        let socket = SocketState::bind(addr.into(), device)?;
 
         Ok(UdpSocket {
             socket: RwLock::new(socket),
@@ -736,10 +751,15 @@ enum SocketState {
         state: noq_udp::UdpSocketState,
         /// The addr we are binding to.
         addr: SocketAddr,
+        /// Interface to pin to via `SO_BINDTODEVICE`; retained so it survives a
+        /// rebind (which re-creates the socket). `None` = unpinned.
+        device: Option<Vec<u8>>,
     },
     Closed {
         /// The addr to rebind to when recovering.
         addr: SocketAddr,
+        /// Interface to re-pin to on rebind, see [`SocketState::Connected`].
+        device: Option<Vec<u8>>,
         last_max_gso_segments: NonZeroUsize,
         last_gro_segments: NonZeroUsize,
         last_may_fragment: bool,
@@ -753,6 +773,7 @@ impl SocketState {
                 socket,
                 state,
                 addr: _,
+                device: _,
             } => Ok((socket, state)),
             Self::Closed { .. } => {
                 warn!("socket closed");
@@ -761,7 +782,7 @@ impl SocketState {
         }
     }
 
-    fn bind(addr: SocketAddr) -> io::Result<Self> {
+    fn bind(addr: SocketAddr, device: Option<Vec<u8>>) -> io::Result<Self> {
         let network = IpFamily::from(addr.ip());
         let socket = socket2::Socket::new(
             network.into(),
@@ -786,17 +807,18 @@ impl SocketState {
             socket.set_only_v6(true)?;
         }
 
-        // mp-iroh POC: pin this socket to a physical interface via SO_BINDTODEVICE.
-        // Hardcoded mapping by bind port through env vars `IROH_BIND_DEV_<port>`
-        // (e.g. IROH_BIND_DEV_6000=eth0). Linux-only; no-op elsewhere or when unset.
-        // Must be set before bind() so the binding is scoped to the device.
+        // mp-iroh: pin this socket to a physical interface via SO_BINDTODEVICE when
+        // a device was supplied (see `bind_full_with_device`). Must be set before
+        // bind() so the binding is scoped to the device. Linux-only; no-op
+        // elsewhere (the device is still retained for rebind on all platforms).
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia"))]
-        {
-            let key = format!("IROH_BIND_DEV_{}", addr.port());
-            if let Ok(dev) = std::env::var(&key) {
-                tracing::info!(port = addr.port(), device = %dev, "mp-iroh: binding UDP socket to device");
-                socket.bind_device(Some(dev.as_bytes()))?;
-            }
+        if let Some(dev) = device.as_deref() {
+            tracing::info!(
+                port = addr.port(),
+                device = %String::from_utf8_lossy(dev),
+                "mp-iroh: binding UDP socket to device"
+            );
+            socket.bind_device(Some(dev))?;
         }
 
         // Binding must happen before calling noq, otherwise `local_addr`
@@ -827,13 +849,14 @@ impl SocketState {
             socket,
             state: socket_state,
             addr: local_addr,
+            device,
         })
     }
 
     fn rebind(&mut self) -> io::Result<()> {
-        let addr = match self {
-            Self::Connected { addr, .. } => *addr,
-            Self::Closed { addr, .. } => *addr,
+        let (addr, device) = match self {
+            Self::Connected { addr, device, .. } => (*addr, device.clone()),
+            Self::Closed { addr, device, .. } => (*addr, device.clone()),
         };
         debug!("rebinding {}", addr);
 
@@ -842,13 +865,14 @@ impl SocketState {
         if let Self::Connected { state, .. } = self {
             *self = SocketState::Closed {
                 addr,
+                device: device.clone(),
                 last_max_gso_segments: state.max_gso_segments(),
                 last_gro_segments: state.gro_segments(),
                 last_may_fragment: state.may_fragment(),
             };
         }
 
-        match Self::bind(addr) {
+        match Self::bind(addr, device) {
             Ok(new_state) => {
                 *self = new_state;
                 Ok(())
@@ -867,9 +891,15 @@ impl SocketState {
 
     fn close(&mut self) -> Option<(tokio::net::UdpSocket, noq_udp::UdpSocketState)> {
         match self {
-            Self::Connected { state, addr, .. } => {
+            Self::Connected {
+                state,
+                addr,
+                device,
+                ..
+            } => {
                 let s = SocketState::Closed {
                     addr: *addr,
+                    device: device.clone(),
                     last_max_gso_segments: state.max_gso_segments(),
                     last_gro_segments: state.gro_segments(),
                     last_may_fragment: state.may_fragment(),
