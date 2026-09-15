@@ -1,3 +1,7 @@
+#[cfg(unix)]
+use std::os::fd::{AsFd, BorrowedFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsSocket, BorrowedSocket};
 use std::{
     future::Future,
     io,
@@ -28,6 +32,82 @@ pub struct UdpSocket {
 /// UDP socket read/write buffer size (7MB). The value of 7MB is chosen as it
 /// is the max supported by a default configuration of macOS. Some platforms will silently clamp the value.
 const SOCKET_BUFFER_SIZE: usize = 7 << 20;
+
+/// A socket that is about to be bound, handed to the hook set with
+/// [`BindOptions::configure_socket`].
+///
+/// It implements [`AsFd`] on unix and [`AsSocket`] on Windows, which is what
+/// socket wrappers take, so the hook can set options with the socket crate of
+/// its choice: `socket2::SockRef::from(&socket)`, or plain `libc::setsockopt`
+/// on the raw fd.
+#[derive(Debug)]
+pub struct SocketRef<'a>(&'a socket2::Socket);
+
+#[cfg(unix)]
+impl AsFd for SocketRef<'_> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+#[cfg(windows)]
+impl AsSocket for SocketRef<'_> {
+    fn as_socket(&self) -> BorrowedSocket<'_> {
+        self.0.as_socket()
+    }
+}
+
+/// The hook set with [`BindOptions::configure_socket`].
+type Configurator = Arc<dyn Fn(SocketRef<'_>, IpFamily) -> io::Result<()> + Send + Sync>;
+
+/// Options to bind a [`UdpSocket`] with.
+///
+/// Used by [`UdpSocket::bind_with`]. The default options match what the other
+/// `bind_*` constructors use.
+#[derive(derive_more::Debug, Default, Clone)]
+pub struct BindOptions {
+    #[debug(skip)]
+    configure: Option<Configurator>,
+}
+
+impl BindOptions {
+    /// Creates the default options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets a hook to run on the socket just before it is bound.
+    ///
+    /// This is the escape hatch for socket options this crate does not model
+    /// itself, like `SO_MARK` on Linux or `IP_BOUND_IF` on Apple platforms. The
+    /// hook runs on every bind, including the rebinds [`UdpSocket`] does to
+    /// recover from network changes, since each of those creates a new socket.
+    /// That also lets the hook pick up state that changed in between, like the
+    /// interface the default route now points at.
+    ///
+    /// An error from the hook fails the bind, rather than leaving a socket that
+    /// silently missed its configuration.
+    ///
+    /// ```no_run
+    /// use std::net::{Ipv4Addr, SocketAddr};
+    ///
+    /// use netwatch::{BindOptions, UdpSocket};
+    ///
+    /// let opts = BindOptions::new().configure_socket(|socket, _family| {
+    ///     socket2::SockRef::from(&socket).set_recv_buffer_size(1 << 20)
+    /// });
+    /// let socket = UdpSocket::bind_with(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), opts)?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn configure_socket(
+        mut self,
+        configure: impl Fn(SocketRef<'_>, IpFamily) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.configure = Some(Arc::new(configure));
+        self
+    }
+}
+
 impl UdpSocket {
     /// Bind only Ipv4 on any interface.
     pub fn bind_v4(port: u16) -> io::Result<Self> {
@@ -52,33 +132,62 @@ impl UdpSocket {
     /// Bind to the given port only on localhost.
     pub fn bind_local(network: IpFamily, port: u16) -> io::Result<Self> {
         let addr = SocketAddr::new(network.local_addr(), port);
-        Self::bind_raw(addr, None)
+        Self::bind_with(addr, BindOptions::default())
     }
 
     /// Bind to the given port and listen on all interfaces.
     pub fn bind(network: IpFamily, port: u16) -> io::Result<Self> {
         let addr = SocketAddr::new(network.unspecified_addr(), port);
-        Self::bind_raw(addr, None)
+        Self::bind_with(addr, BindOptions::default())
     }
 
     /// Bind to any provided [`SocketAddr`].
     pub fn bind_full(addr: impl Into<SocketAddr>) -> io::Result<Self> {
-        Self::bind_raw(addr, None)
+        Self::bind_with(addr, BindOptions::default())
     }
 
     /// Bind to any provided [`SocketAddr`], pinned to a physical interface.
     ///
     /// `device` is an interface name (e.g. `b"eth0"`); when `Some` the socket is
     /// pinned to it via `SO_BINDTODEVICE` (Linux/Android/Fuchsia only, no-op
-    /// elsewhere). The device is retained so it is re-applied on [`rebind`], which
-    /// re-creates the underlying socket on network changes.
+    /// elsewhere). The pinning is installed as a [`BindOptions::configure_socket`]
+    /// hook, so it is re-applied on [`rebind`], which re-creates the underlying
+    /// socket on network changes.
     ///
     /// [`rebind`]: Self::rebind
     pub fn bind_full_with_device(
         addr: impl Into<SocketAddr>,
         device: Option<Vec<u8>>,
     ) -> io::Result<Self> {
-        Self::bind_raw(addr, device)
+        let addr = addr.into();
+        let opts = match device {
+            #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia"))]
+            Some(dev) => {
+                let port = addr.port();
+                BindOptions::new().configure_socket(move |socket, _family| {
+                    tracing::info!(
+                        port,
+                        device = %String::from_utf8_lossy(&dev),
+                        "mp-iroh: binding UDP socket to device"
+                    );
+                    socket.0.bind_device(Some(&dev))
+                })
+            }
+            _ => BindOptions::default(),
+        };
+        Self::bind_with(addr, opts)
+    }
+
+    /// Bind to any provided [`SocketAddr`], using the given [`BindOptions`].
+    pub fn bind_with(addr: impl Into<SocketAddr>, opts: BindOptions) -> io::Result<Self> {
+        let socket = SocketState::bind(addr.into(), opts.configure)?;
+
+        Ok(UdpSocket {
+            socket: RwLock::new(socket),
+            recv_waker: AtomicWaker::default(),
+            send_waker: AtomicWaker::default(),
+            is_broken: AtomicBool::new(false),
+        })
     }
 
     /// Is the socket broken and needs a rebind?
@@ -109,17 +218,6 @@ impl UdpSocket {
         self.wake_all();
 
         Ok(())
-    }
-
-    fn bind_raw(addr: impl Into<SocketAddr>, device: Option<Vec<u8>>) -> io::Result<Self> {
-        let socket = SocketState::bind(addr.into(), device)?;
-
-        Ok(UdpSocket {
-            socket: RwLock::new(socket),
-            recv_waker: AtomicWaker::default(),
-            send_waker: AtomicWaker::default(),
-            is_broken: AtomicBool::new(false),
-        })
     }
 
     /// Receives a single datagram message on the socket from the remote address
@@ -744,22 +842,23 @@ impl Future for SendToFut<'_, '_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 enum SocketState {
     Connected {
         socket: tokio::net::UdpSocket,
         state: noq_udp::UdpSocketState,
         /// The addr we are binding to.
         addr: SocketAddr,
-        /// Interface to pin to via `SO_BINDTODEVICE`; retained so it survives a
-        /// rebind (which re-creates the socket). `None` = unpinned.
-        device: Option<Vec<u8>>,
+        /// The hook to rerun when rebinding, if any.
+        #[debug(skip)]
+        configure: Option<Configurator>,
     },
     Closed {
         /// The addr to rebind to when recovering.
         addr: SocketAddr,
-        /// Interface to re-pin to on rebind, see [`SocketState::Connected`].
-        device: Option<Vec<u8>>,
+        /// The hook to rerun when rebinding, if any.
+        #[debug(skip)]
+        configure: Option<Configurator>,
         last_max_gso_segments: NonZeroUsize,
         last_gro_segments: NonZeroUsize,
         last_may_fragment: bool,
@@ -773,7 +872,7 @@ impl SocketState {
                 socket,
                 state,
                 addr: _,
-                device: _,
+                configure: _,
             } => Ok((socket, state)),
             Self::Closed { .. } => {
                 warn!("socket closed");
@@ -782,7 +881,7 @@ impl SocketState {
         }
     }
 
-    fn bind(addr: SocketAddr, device: Option<Vec<u8>>) -> io::Result<Self> {
+    fn bind(addr: SocketAddr, configure: Option<Configurator>) -> io::Result<Self> {
         let network = IpFamily::from(addr.ip());
         let socket = socket2::Socket::new(
             network.into(),
@@ -807,18 +906,11 @@ impl SocketState {
             socket.set_only_v6(true)?;
         }
 
-        // mp-iroh: pin this socket to a physical interface via SO_BINDTODEVICE when
-        // a device was supplied (see `bind_full_with_device`). Must be set before
-        // bind() so the binding is scoped to the device. Linux-only; no-op
-        // elsewhere (the device is still retained for rebind on all platforms).
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia"))]
-        if let Some(dev) = device.as_deref() {
-            tracing::info!(
-                port = addr.port(),
-                device = %String::from_utf8_lossy(dev),
-                "mp-iroh: binding UDP socket to device"
-            );
-            socket.bind_device(Some(dev))?;
+        // Let the caller configure the socket before it is bound. An error here
+        // fails the bind: a socket that silently missed its configuration would
+        // send traffic where the caller did not want it.
+        if let Some(configure) = &configure {
+            configure(SocketRef(&socket), network)?;
         }
 
         // Binding must happen before calling noq, otherwise `local_addr`
@@ -849,14 +941,18 @@ impl SocketState {
             socket,
             state: socket_state,
             addr: local_addr,
-            device,
+            configure,
         })
     }
 
     fn rebind(&mut self) -> io::Result<()> {
-        let (addr, device) = match self {
-            Self::Connected { addr, device, .. } => (*addr, device.clone()),
-            Self::Closed { addr, device, .. } => (*addr, device.clone()),
+        let (addr, configure) = match self {
+            Self::Connected {
+                addr, configure, ..
+            }
+            | Self::Closed {
+                addr, configure, ..
+            } => (*addr, configure.clone()),
         };
         debug!("rebinding {}", addr);
 
@@ -865,14 +961,14 @@ impl SocketState {
         if let Self::Connected { state, .. } = self {
             *self = SocketState::Closed {
                 addr,
-                device: device.clone(),
+                configure: configure.clone(),
                 last_max_gso_segments: state.max_gso_segments(),
                 last_gro_segments: state.gro_segments(),
                 last_may_fragment: state.may_fragment(),
             };
         }
 
-        match Self::bind(addr, device) {
+        match Self::bind(addr, configure) {
             Ok(new_state) => {
                 *self = new_state;
                 Ok(())
@@ -894,12 +990,12 @@ impl SocketState {
             Self::Connected {
                 state,
                 addr,
-                device,
+                configure,
                 ..
             } => {
                 let s = SocketState::Closed {
                     addr: *addr,
-                    device: device.clone(),
+                    configure: configure.clone(),
                     last_max_gso_segments: state.max_gso_segments(),
                     last_gro_segments: state.gro_segments(),
                     last_may_fragment: state.may_fragment(),
@@ -1111,6 +1207,11 @@ impl Future for SendFutNoq<'_, '_> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        net::Ipv4Addr,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
     use testresult::TestResult;
 
     use super::*;
@@ -1168,6 +1269,44 @@ mod tests {
         }
 
         handle_a.await.ok();
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_configure_socket_runs_on_every_bind() -> TestResult {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let opts = BindOptions::new().configure_socket(move |socket, family| {
+            assert_eq!(family, IpFamily::V4);
+            // The hook gets a real socket, before it is bound.
+            socket2::SockRef::from(&socket).set_reuse_address(true)?;
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let socket = UdpSocket::bind_with(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), opts)?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "hook did not run on bind");
+
+        socket.rebind()?;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "hook did not run again on rebind"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_configure_socket_error_fails_the_bind() -> TestResult {
+        let opts =
+            BindOptions::new().configure_socket(|_socket, _family| Err(io::Error::other("nope")));
+
+        assert!(
+            UdpSocket::bind_with(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), opts).is_err(),
+            "a failing hook must fail the bind"
+        );
 
         Ok(())
     }
